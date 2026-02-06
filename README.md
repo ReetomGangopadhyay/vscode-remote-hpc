@@ -1,6 +1,11 @@
 # vscode-remote-hpc
 
-A one-click script to setup and connect vscode to a Slurm-based HPC compute node, directly from the VS Code remote explorer. 
+A one-click script to setup and connect vscode to an HPC compute node, directly from the VS Code remote explorer. 
+
+**Supported job schedulers:** Slurm (default) and SGE (Sun Grid Engine)
+
+For **Slurm**, use the main scripts: `vscode-remote.sh` and `install.sh`
+For **SGE**, use the SGE variants: `vscode-remote-sge.sh` and `install-sge.sh` (see [README-SGE.md](README-SGE.md) for setup instructions)
 
 ## Features
 This script is designed to be used with the [Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh) extension for Visual Studio Code. 

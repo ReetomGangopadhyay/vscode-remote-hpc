@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# Set your Slurm parameters for GPU and CPU jobs here
-SBATCH_PARAM_CPU="-q ni -t 12:00:00 --mem=32G -c 1"
-SBATCH_PARAM_GPU="-q ng --gpus=1 -t 04:00:00 --mem=32G -c 1"
+# Set your SGE parameters for GPU and CPU jobs here
+# Example: "-l mem=32G,cpu=1" or "-l gpu=1,mem=32G"
+# For GPU jobs, you may need to add GPU resource requests depending on your SGE configuration
+QSUB_PARAM_CPU="-l mem=32G,cpu=1 -l h_rt=12:00:00"
+QSUB_PARAM_GPU="-l gpu=1,mem=32G,cpu=1 -l h_rt=04:00:00"
 
 # The time you expect a job to start in (seconds)
 # If a job doesn't start within this time, the script will exit and cancel the pending job
@@ -32,26 +34,28 @@ function usage ()
         Host vscode-remote-cpu
             User USERNAME
             IdentityFile ~/.ssh/vscode-remote
-            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote cpu\"
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge cpu\"
             StrictHostKeyChecking no  
 
     You can have a CPU and GPU job running at the same time, just add them as separate hosts in your config.
     "
 } 
 
-function query_slurm () {
-    # only list states that can result in a running job
-    list=($(squeue --me --states=R,PD,S,CF,RF,RH,RQ -h -O JobId:" ",Name:" ",State:" ",NodeList:" " | grep $JOB_NAME))
-
-    if [ ! ${#list[@]} -eq 0 ]; then
-        JOB_ID=${list[0]}
-        JOB_FULLNAME=${list[1]}
-        JOB_STATE=${list[2]}
-        JOB_NODE=${list[3]}
-
-        split=(${JOB_FULLNAME//%/ })
-        JOB_PORT=${split[1]}
-
+function query_sge () {
+    # Query SGE for jobs matching the pattern
+    # SGE job states: r=running, qw=queued waiting, hqw=held queued waiting, h=held, E=error, e=error/executing
+    job_info=$(qstat | grep "$JOB_NAME" | head -1)
+    
+    if [ ! -z "$job_info" ]; then
+        # Parse qstat output to extract job ID, state, and hostname
+        JOB_ID=$(echo "$job_info" | awk '{print $1}')
+        JOB_STATE=$(echo "$job_info" | awk '{print $5}')
+        JOB_NODE=$(echo "$job_info" | awk '{print $8}')
+        JOB_FULLNAME=$(echo "$job_info" | awk '{print $3}')
+        
+        # Extract port from job name (format: vscode-remote-cpu-PORT or vscode-remote-gpu-PORT)
+        JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
+        
         >&2 echo "Job is $JOB_STATE ( id: $JOB_ID, name: $JOB_FULLNAME${JOB_NODE:+, node: $JOB_NODE} )" 
     else
         JOB_ID=""
@@ -64,7 +68,7 @@ function query_slurm () {
 
 function cleanup () {
     if [ ! -z "${JOB_SUBMIT_ID}" ]; then
-        scancel $JOB_SUBMIT_ID
+        qdel $JOB_SUBMIT_ID 2>/dev/null
         >&2 echo "Cancelled pending job $JOB_SUBMIT_ID"
     fi
 }
@@ -78,31 +82,30 @@ function timeout () {
 }
 
 function cancel () {
-    query_slurm > /dev/null 2>&1
+    query_sge > /dev/null 2>&1
     while [ ! -z "${JOB_ID}" ]; do
         echo "Cancelling running job $JOB_ID on $JOB_NODE"
-        scancel $JOB_ID
+        qdel $JOB_ID
         timeout
         sleep 2
-        query_slurm > /dev/null 2>&1
+        query_sge > /dev/null 2>&1
     done
 }
 
 function list () {
-    width=$((${#JOB_NAME} + 11))
-    echo "$(squeue --me -O JobId,Partition,Name:$width,State,TimeUsed,TimeLimit,NodeList | grep -E "JOBID|$JOB_NAME")"
+    echo "$(qstat | grep -E "job-ID|$JOB_NAME")"
 }
 
 function ssh_connect () {
     ROOT_NAME=$JOB_NAME
 
     JOB_NAME=$ROOT_NAME-cpu
-    query_slurm
+    query_sge
     CPU_NODE=$JOB_NODE
     CPU_PORT=$JOB_PORT
 
     JOB_NAME=$ROOT_NAME-gpu
-    query_slurm
+    query_sge
     GPU_NODE=$JOB_NODE
     GPU_PORT=$JOB_PORT
 
@@ -139,19 +142,20 @@ function ssh_connect () {
 }
 
 function connect () {
-    query_slurm
+    query_sge
 
     if [ -z "${JOB_STATE}" ]; then
         PORT=$(shuf -i 10000-65000 -n 1)
-        list=($(/usr/bin/sbatch -J $JOB_NAME%$PORT $SBATCH_PARAM $SCRIPT_DIR/vscode-remote-job.sh $PORT))
-        JOB_SUBMIT_ID=${list[3]}
+        # Submit job with qsub, capture job ID from output
+        submit_output=$(qsub -N $JOB_NAME-$PORT $QSUB_PARAM $SCRIPT_DIR/vscode-remote-job-sge.sh $PORT 2>&1)
+        JOB_SUBMIT_ID=$(echo "$submit_output" | grep -oE '[0-9]+' | head -1)
         >&2 echo "Submitted new $JOB_NAME job (id: $JOB_SUBMIT_ID)"
     fi
 
-    while [ ! "$JOB_STATE" == "RUNNING" ]; do
+    while [ ! "$JOB_STATE" == "r" ]; do
         timeout
         sleep 5
-        query_slurm
+        query_sge
     done
 
     >&2 echo "Connecting to $JOB_NODE"
@@ -173,8 +177,8 @@ if [ ! -z "$1" ]; then
         list)   list ;;
         cancel) cancel ;;
         ssh)    ssh_connect ;;
-        cpu)    JOB_NAME=$JOB_NAME-cpu; SBATCH_PARAM=$SBATCH_PARAM_CPU; connect ;;
-        gpu)    JOB_NAME=$JOB_NAME-gpu; SBATCH_PARAM=$SBATCH_PARAM_GPU; connect ;;
+        cpu)    JOB_NAME=$JOB_NAME-cpu; QSUB_PARAM=$QSUB_PARAM_CPU; connect ;;
+        gpu)    JOB_NAME=$JOB_NAME-gpu; QSUB_PARAM=$QSUB_PARAM_GPU; connect ;;
         help)   usage ;;
         *)  echo -e "Command '$1' does not exist" >&2
             usage; exit 1 ;;
