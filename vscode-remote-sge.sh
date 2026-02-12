@@ -42,22 +42,23 @@ function usage ()
 } 
 
 function query_sge () {
-    # Query SGE for jobs matching the pattern
-    # SGE job states: r=running, qw=queued waiting, hqw=held queued waiting, h=held, E=error, e=error/executing
     job_info=$(qstat | grep "$JOB_NAME" | head -1)
-    
+
     if [ ! -z "$job_info" ]; then
-        # Parse qstat output to extract job ID, state, and hostname
         JOB_ID=$(echo "$job_info" | awk '{print $1}')
         JOB_STATE=$(echo "$job_info" | awk '{print $5}')
+
+        # Queue instance looks like p-int@scc-pi2.scc.bu.edu
         JOB_NODE=$(echo "$job_info" | awk '{print $8}')
-        JOB_NODE="${JOB_NODE#*@}"
-        JOB_FULLNAME=$(echo "$job_info" | awk '{print $3}')
-        
-        # Extract port from job name (format: vscode-remote-cpu-PORT or vscode-remote-gpu-PORT)
-        JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
-        
-        >&2 echo "Job is $JOB_STATE ( id: $JOB_ID, name: $JOB_FULLNAME${JOB_NODE:+, node: $JOB_NODE} )" 
+        JOB_NODE="${JOB_NODE#*@}"   # strip "queue@"
+
+        # Get full job name reliably (not truncated)
+        JOB_FULLNAME=$(qstat -j "$JOB_ID" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')
+
+        # Port is the last "-" chunk of the full job name
+        JOB_PORT=$(echo "$JOB_FULLNAME" | awk -F- '{print $NF}')
+
+        >&2 echo "Job is $JOB_STATE ( id: $JOB_ID, name: $JOB_FULLNAME${JOB_NODE:+, node: $JOB_NODE} )"
     else
         JOB_ID=""
         JOB_FULLNAME=""
