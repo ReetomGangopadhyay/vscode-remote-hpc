@@ -3,12 +3,12 @@
 # Set your SGE parameters for GPU and CPU jobs here
 # Example: "-l mem=32G,cpu=1" or "-l gpu=1,mem=32G"
 # For GPU jobs, you may need to add GPU resource requests depending on your SGE configuration
-QSUB_PARAM_CPU="-l mem=32G,cpu=1 -l h_rt=12:00:00"
-QSUB_PARAM_GPU="-l gpu=1,mem=32G,cpu=1 -l h_rt=04:00:00"
+QSUB_PARAM_CPU="-pe omp 4 -l mem_free=16G,h_rt=12:00:00"
+QSUB_PARAM_GPU="-pe omp 4 -l gpu=1,mem_free=16G,h_rt=04:00:00"
 
 # The time you expect a job to start in (seconds)
 # If a job doesn't start within this time, the script will exit and cancel the pending job
-TIMEOUT=300
+TIMEOUT=1800
 
 
 ####################
