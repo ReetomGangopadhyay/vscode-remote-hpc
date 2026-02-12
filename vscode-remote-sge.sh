@@ -51,6 +51,7 @@ function query_sge () {
         JOB_ID=$(echo "$job_info" | awk '{print $1}')
         JOB_STATE=$(echo "$job_info" | awk '{print $5}')
         JOB_NODE=$(echo "$job_info" | awk '{print $8}')
+        JOB_NODE="${JOB_NODE#*@}"
         JOB_FULLNAME=$(echo "$job_info" | awk '{print $3}')
         
         # Extract port from job name (format: vscode-remote-cpu-PORT or vscode-remote-gpu-PORT)
