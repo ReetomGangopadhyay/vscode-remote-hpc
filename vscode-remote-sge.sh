@@ -1,11 +1,21 @@
 #!/bin/bash
 
-# Set your SGE parameters for GPU and CPU jobs here
-# Example: "-l mem=32G,cpu=1" or "-l gpu=1,mem=32G"
+# SGE qsub resource presets.
+#
+# Defaults are intentionally short-running because the job continues running after you
+# disconnect from VS Code. Adjust as needed for your cluster.
+#
+# Add more presets by defining variables named QSUB_PARAM_<PROFILE>, e.g.
+#   QSUB_PARAM_CPU_4="..."
+#   QSUB_PARAM_CPU_28="..."
+#
+# Use the profile name as the argument to this script in your ProxyCommand:
+#   ProxyCommand ssh HPC-LOGIN "~/bin/vscode-remote-sge cpu_4"
+#
 # NOTE (BU SCC): job names are truncated in `qstat` (vscode-remote-* -> vscode-rem),
 # so this script uses `qstat -j` to recover the full job name.
-QSUB_PARAM_CPU="-pe smp 4 -l mem_free=16G -l h_rt=12:00:00"
-QSUB_PARAM_GPU="-pe smp 4 -l mem_free=16G -l h_rt=04:00:00"
+QSUB_PARAM_CPU="-pe omp 1   -l h_rt=04:00:00"
+QSUB_PARAM_GPU="-pe omp 4   -l gpus=1,gpu_c=6.0 -l h_rt=04:00:00"
 
 # The time you expect a job to start in (seconds)
 # If a job doesn't start within this time, the script will exit and cancel the pending job
@@ -18,40 +28,50 @@ TIMEOUT=1800
 
 function usage ()
 {
-    echo "Usage :  $0 [command]
+    echo "Usage :  $0 [command|profile]
 
     General commands:
     list      List running vscode-remote jobs
-    cancel    Cancels running vscode-remote jobs
+    cancel    Cancels all running vscode-remote jobs
     ssh       SSH into the node of a running job
     help      Display this message
 
-    Job commands (see usage below):
-    cpu       Connect to a CPU node
-    gpu       Connect to a GPU node
+    Job profiles:
+    Any argument that is not a general command is treated as a job profile.
+    Profiles are defined by variables named QSUB_PARAM_<PROFILE> at the top of this file.
 
-    You should _NOT_ manually call the script with 'cpu' or 'gpu' commands.
-    They should be used in the ProxyCommand in your ~/.ssh/config file, for example:
-        Host vscode-remote-cpu
+    Built-in defaults:
+    cpu       Connect to a CPU node   (QSUB_PARAM_CPU)
+    gpu       Connect to a GPU node   (QSUB_PARAM_GPU)
+
+    Examples:
+        Host vscode-remote-sge-cpu
             User USERNAME
-            IdentityFile ~/.ssh/vscode-remote
+            IdentityFile ~/.ssh/vscode-remote-sge
             ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge cpu\"
             StrictHostKeyChecking no
 
-    You can have a CPU and GPU job running at the same time, just add them as separate hosts in your config.
+        Host vscode-remote-sge-cpu4
+            User USERNAME
+            IdentityFile ~/.ssh/vscode-remote-sge
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge cpu_4\"
+            StrictHostKeyChecking no
+
     "
 }
 
 function query_sge () {
     # qstat truncates long names (vscode-remote-* becomes vscode-rem),
     # so match the truncated prefix and then confirm full name via qstat -j.
+    local prefix="${1:-$JOB_NAME}"
+
     job_info=""
     JOB_FULLNAME=""
 
     while read -r line; do
       jid="$(echo "$line" | awk '{print $1}')"
-      full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
-      if [[ "$full" == "$JOB_NAME"* ]]; then
+      full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ 	]+/,"",$2); print $2; exit}')"
+      if [[ "$full" == "$prefix"* ]]; then
         job_info="$line"
         JOB_FULLNAME="$full"
         break
@@ -64,7 +84,7 @@ function query_sge () {
         JOB_STATE=$(echo "$job_info" | awk '{print $5}')
         JOB_QUEUE_INSTANCE=$(echo "$job_info" | awk '{print $8}')
 
-        # Extract port from full job name (format: vscode-remote-cpu-PORT or vscode-remote-gpu-PORT)
+        # Extract port from full job name (format: vscode-remote-<profile>-PORT)
         JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
 
         # Convert queue instance like "p-int@scc-pi4.scc.bu.edu" -> "scc-pi4.scc.bu.edu"
@@ -100,14 +120,65 @@ function timeout () {
     fi
 }
 
+
+
+function list_profiles () {
+    # List available QSUB_PARAM_* presets, printed as profile names (lowercase)
+    compgen -A variable QSUB_PARAM_ | sed 's/^QSUB_PARAM_//' | tr '[:upper:]' '[:lower:]'
+}
+
+function resolve_profile () {
+    PROFILE_RAW="$1"
+    # Map profile to variable key: cpu-4 -> CPU_4, cpu_4 -> CPU_4
+    PROFILE_KEY="$(echo "$PROFILE_RAW" | tr '[:lower:]-' '[:upper:]_')"
+    QSUB_VAR="QSUB_PARAM_${PROFILE_KEY}"
+    QSUB_PARAM="${!QSUB_VAR:-}"
+
+    if [ -z "$QSUB_PARAM" ]; then
+        >&2 echo "Unknown profile '$PROFILE_RAW' (expected variable $QSUB_VAR)."
+        >&2 echo "Available profiles:"
+        list_profiles | sed 's/^/  - /' >&2
+        exit 1
+    fi
+}
+
+function collect_jobs () {
+    # Collect (jid, full_name, state, node, port) for jobs with name starting with "$1"
+    local prefix="$1"
+    JOB_ROWS=()
+
+    while read -r line; do
+      jid="$(echo "$line" | awk '{print $1}')"
+      state="$(echo "$line" | awk '{print $5}')"
+      queueinst="$(echo "$line" | awk '{print $8}')"
+      full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+      if [[ "$full" == "$prefix"* ]]; then
+        port="$(echo "$full" | rev | cut -d'-' -f1 | rev)"
+        case "$queueinst" in
+            *@*) node="${queueinst##*@}" ;;
+            *)   node="" ;;
+        esac
+        JOB_ROWS+=("$jid|$full|$state|$node|$port")
+      fi
+    done < <(qstat -u "$USER" 2>/dev/null | awk '$3 ~ /^vscode-rem/ {print}')
+}
+
 function cancel () {
-    query_sge > /dev/null 2>&1
-    while [ ! -z "${JOB_ID}" ]; do
-        echo "Cancelling running job $JOB_ID on ${JOB_NODE:-unknown}"
-        qdel "$JOB_ID"
+    # Cancel all running/pending vscode-remote jobs (any profile)
+    while true; do
+        collect_jobs "${JOB_NAME}-"
+        if [ ${#JOB_ROWS[@]} -eq 0 ]; then
+            break
+        fi
+        for row in "${JOB_ROWS[@]}"; do
+            jid="$(echo "$row" | cut -d'|' -f1)"
+            full="$(echo "$row" | cut -d'|' -f2)"
+            node="$(echo "$row" | cut -d'|' -f4)"
+            echo "Cancelling job $jid (${full}${node:+ on $node})"
+            qdel "$jid" 2>/dev/null
+        done
         timeout
         sleep 2
-        query_sge > /dev/null 2>&1
     done
 }
 
@@ -116,65 +187,68 @@ function list () {
 }
 
 function ssh_connect () {
-    ROOT_NAME=$JOB_NAME
+    # SSH into the node of a running vscode-remote job (any profile)
+    collect_jobs "${JOB_NAME}-"
 
-    JOB_NAME=$ROOT_NAME-cpu
-    query_sge
-    CPU_NODE=$JOB_NODE
-    CPU_PORT=$JOB_PORT
-
-    JOB_NAME=$ROOT_NAME-gpu
-    query_sge
-    GPU_NODE=$JOB_NODE
-    GPU_PORT=$JOB_PORT
-
-    if [ ! -z "${CPU_NODE}" ] && [ ! -z "${GPU_NODE}" ]; then
-        echo "Multiple jobs found, please specify which node to connect to:"
-        echo "1) $CPU_NODE (CPU)"
-        echo "2) $GPU_NODE (GPU)"
-        read -p "Enter 1 or 2: " choice
-        if [ "$choice" == "1" ]; then
-            GPU_NODE=
-        elif [ "$choice" == "2" ]; then
-            CPU_NODE=
-        else
-            echo "Invalid choice"
-            exit 1
-        fi
-    fi
-
-    if [ ! -z "${CPU_NODE}" ]; then
-        NODE=$CPU_NODE
-        PORT=$CPU_PORT
-        TYPE=CPU
-    elif [ ! -z "${GPU_NODE}" ]; then
-        NODE=$GPU_NODE
-        PORT=$GPU_PORT
-        TYPE=GPU
-    else
+    if [ ${#JOB_ROWS[@]} -eq 0 ]; then
         echo "No running job found"
         exit 1
     fi
 
-    echo "Connecting to $NODE:$PORT ($TYPE) via SSH"
-    ssh -p "$PORT" "$NODE"
+    if [ ${#JOB_ROWS[@]} -gt 1 ]; then
+        echo "Multiple jobs found, please choose:"
+        i=1
+        for row in "${JOB_ROWS[@]}"; do
+            full="$(echo "$row" | cut -d'|' -f2)"
+            state="$(echo "$row" | cut -d'|' -f3)"
+            node="$(echo "$row" | cut -d'|' -f4)"
+            port="$(echo "$row" | cut -d'|' -f5)"
+            printf "%d) %s (state: %s%s%s)
+" "$i" "$full" "$state" "${node:+, node: }" "${node:-}"
+            i=$((i+1))
+        done
+        read -p "Enter a number: " choice
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#JOB_ROWS[@]} ]; then
+            echo "Invalid choice"
+            exit 1
+        fi
+        row="${JOB_ROWS[$((choice-1))]}"
+    else
+        row="${JOB_ROWS[0]}"
+    fi
+
+    node="$(echo "$row" | cut -d'|' -f4)"
+    port="$(echo "$row" | cut -d'|' -f5)"
+    full="$(echo "$row" | cut -d'|' -f2)"
+
+    if [ -z "$node" ] || [ -z "$port" ]; then
+        echo "Selected job is not yet running on a node (name: $full)"
+        exit 1
+    fi
+
+    echo "Connecting to $node:$port via SSH"
+    ssh -p "$port" "$node"
 }
 
-function connect () {
-    query_sge
+function connect_profile () {
+    local profile="$1"
+    resolve_profile "$profile"
+    local job_prefix="${JOB_NAME}-${profile}"
+
+    query_sge "$job_prefix"
 
     if [ -z "${JOB_STATE}" ]; then
         PORT=$(shuf -i 10000-65000 -n 1)
         # Submit job with qsub, capture job ID from output
-        submit_output=$(qsub -N "$JOB_NAME-$PORT" $QSUB_PARAM "$SCRIPT_DIR/vscode-remote-job-sge.sh" "$PORT" 2>&1)
+        submit_output=$(qsub -N "$job_prefix-$PORT" $QSUB_PARAM "$SCRIPT_DIR/vscode-remote-job-sge.sh" "$PORT" 2>&1)
         JOB_SUBMIT_ID=$(echo "$submit_output" | grep -oE '[0-9]+' | head -1)
-        >&2 echo "Submitted new $JOB_NAME job (id: $JOB_SUBMIT_ID)"
+        >&2 echo "Submitted new $job_prefix job (id: $JOB_SUBMIT_ID)"
     fi
 
     while [ ! "$JOB_STATE" == "r" ]; do
         timeout
         sleep 5
-        query_sge
+        query_sge "$job_prefix"
     done
 
     >&2 echo "Connecting to $JOB_NODE"
@@ -196,11 +270,8 @@ if [ ! -z "${1:-}" ]; then
         list)   list ;;
         cancel) cancel ;;
         ssh)    ssh_connect ;;
-        cpu)    JOB_NAME=$JOB_NAME-cpu; QSUB_PARAM=$QSUB_PARAM_CPU; connect ;;
-        gpu)    JOB_NAME=$JOB_NAME-gpu; QSUB_PARAM=$QSUB_PARAM_GPU; connect ;;
         help)   usage ;;
-        *)  echo -e "Command '$1' does not exist" >&2
-            usage; exit 1 ;;
+        *)      connect_profile "$1" ;;
     esac
     exit 0
 else
