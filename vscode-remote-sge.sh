@@ -104,7 +104,7 @@ function query_sge () {
 
     while read -r line; do
       jid="$(echo "$line" | awk '{print $1}')"
-      full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ 	]+/,"",$2); print $2; exit}')"
+      full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
       if [[ "$full" == "$prefix"* ]]; then
         job_info="$line"
         JOB_FULLNAME="$full"
@@ -113,7 +113,7 @@ function query_sge () {
     done < <(qstat -u "$USER" 2>/dev/null | awk '$3 ~ /^vscode-rem/ {print}')
 
     if [ ! -z "$job_info" ]; then
-        # Parse qstat output to extract job ID, state, and queue instance
+        # Parse qstat output to extract job ID and state
         JOB_ID=$(echo "$job_info" | awk '{print $1}')
         JOB_STATE=$(echo "$job_info" | awk '{print $5}')
         JOB_QUEUE_INSTANCE=$(echo "$job_info" | awk '{print $8}')
@@ -121,12 +121,18 @@ function query_sge () {
         # Extract port from full job name (format: PREFIX-PORT)
         JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
 
-        # Convert queue instance like "p-int@scc-pi4.scc.bu.edu" -> "scc-pi4.scc.bu.edu"
-        # If not yet assigned (no '@'), leave JOB_NODE empty
-        case "$JOB_QUEUE_INSTANCE" in
-            *@*) JOB_NODE="${JOB_QUEUE_INSTANCE##*@}" ;;
-            *)   JOB_NODE="" ;;
-        esac
+        # Get full exec_host from qstat -j instead of truncated qstat table output
+        JOB_EXEC_HOST=$(qstat -j "$JOB_ID" 2>/dev/null | awk -F: '/exec_host:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')
+
+        # exec_host examples:
+        #   all.q@scc-tj4.scc.bu.edu
+        #   all.q@scc-tj4.scc.bu.edu/0
+        if [[ "$JOB_EXEC_HOST" == *@* ]]; then
+            JOB_NODE="${JOB_EXEC_HOST##*@}"
+            JOB_NODE="${JOB_NODE%%/*}"
+        else
+            JOB_NODE=""
+        fi
 
         >&2 echo "Job is $JOB_STATE ( id: $JOB_ID, name: $JOB_FULLNAME${JOB_NODE:+, node: $JOB_NODE} )"
     else
@@ -162,14 +168,16 @@ function collect_jobs () {
     while read -r line; do
       jid="$(echo "$line" | awk '{print $1}')"
       state="$(echo "$line" | awk '{print $5}')"
-      queueinst="$(echo "$line" | awk '{print $8}')"
       full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
       if [[ "$full" == "$prefix"* ]]; then
         port="$(echo "$full" | rev | cut -d'-' -f1 | rev)"
-        case "$queueinst" in
-            *@*) node="${queueinst##*@}" ;;
-            *)   node="" ;;
-        esac
+        exechost="$(qstat -j "$jid" 2>/dev/null | awk -F: '/exec_host:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+        if [[ "$exechost" == *@* ]]; then
+            node="${exechost##*@}"
+            node="${node%%/*}"
+        else
+            node=""
+        fi
         JOB_ROWS+=("$jid|$full|$state|$node|$port")
       fi
     done < <(qstat -u "$USER" 2>/dev/null | awk '$3 ~ /^vscode-rem/ {print}')
@@ -271,3 +279,26 @@ function connect () {
 
     nc "$JOB_NODE" "$JOB_PORT"
 }
+
+if [ ! -z "${1:-}" ]; then
+    JOB_NAME=vscode-remote
+    SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+    START=$(date +%s)
+    trap "cleanup && exit 1" INT TERM
+    case $1 in
+        list)   list ;;
+        cancel) cancel ;;
+        ssh)    ssh_connect ;;
+        help)   usage ;;
+        -*)     parse_qsub_args "$@"; connect ;;
+        *)
+            >&2 echo "Unknown command: $1"
+            usage
+            exit 1
+            ;;
+    esac
+    exit 0
+else
+    usage
+    exit 0
+fi
