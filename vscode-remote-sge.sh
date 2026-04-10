@@ -271,26 +271,3 @@ function connect () {
 
     nc "$JOB_NODE" "$JOB_PORT"
 }
-
-if [ ! -z "${1:-}" ]; then
-    JOB_NAME=vscode-remote
-    SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-    START=$(date +%s)
-    trap "cleanup && exit 1" INT TERM
-    case $1 in
-        list)   list ;;
-        cancel) cancel ;;
-        ssh)    ssh_connect ;;
-        help)   usage ;;
-        -*)     parse_qsub_args "$@"; connect ;;
-        *)
-            >&2 echo "Unknown command: $1"
-            usage
-            exit 1
-            ;;
-    esac
-    exit 0
-else
-    usage
-    exit 0
-fi
