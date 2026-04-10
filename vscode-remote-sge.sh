@@ -1,22 +1,5 @@
 #!/bin/bash
 
-# SGE qsub resource presets.
-#
-# Defaults are intentionally short-running because the job continues running after you
-# disconnect from VS Code. Adjust as needed for your cluster.
-#
-# Add more presets by defining variables named QSUB_PARAM_<PROFILE>, e.g.
-#   QSUB_PARAM_CPU_4="..."
-#   QSUB_PARAM_CPU_28="..."
-#
-# Use the profile name as the argument to this script in your ProxyCommand:
-#   ProxyCommand ssh HPC-LOGIN "~/bin/vscode-remote-sge cpu_4"
-#
-# NOTE (BU SCC): job names are truncated in `qstat` (vscode-remote-* -> vscode-rem),
-# so this script uses `qstat -j` to recover the full job name.
-QSUB_PARAM_CPU="-pe omp 1   -l h_rt=04:00:00"
-QSUB_PARAM_GPU="-pe omp 4   -l gpus=1,gpu_c=6.0 -l h_rt=04:00:00"
-
 # The time you expect a job to start in (seconds)
 # If a job doesn't start within this time, the script will exit and cancel the pending job
 TIMEOUT=1800
@@ -28,7 +11,7 @@ TIMEOUT=1800
 
 function usage ()
 {
-    echo "Usage :  $0 [command|profile]
+    echo "Usage :  $0 [command | qsub-options]
 
     General commands:
     list      List running vscode-remote jobs
@@ -36,28 +19,79 @@ function usage ()
     ssh       SSH into the node of a running job
     help      Display this message
 
-    Job profiles:
-    Any argument that is not a general command is treated as a job profile.
-    Profiles are defined by variables named QSUB_PARAM_<PROFILE> at the top of this file.
+    Job options:
+    Pass qsub options directly. A unique job name is derived from the options
+    using an md5 hash, so reconnections work automatically.
 
-    Built-in defaults:
-    cpu       Connect to a CPU node   (QSUB_PARAM_CPU)
-    gpu       Connect to a GPU node   (QSUB_PARAM_GPU)
+    Use -N <label> to distinguish multiple jobs with identical resource flags.
+    The label is prepended to the hash (e.g. jobA.HASH.username).
 
     Examples:
-        Host vscode-remote-sge-cpu
-            User USERNAME
-            IdentityFile ~/.ssh/vscode-remote-sge
-            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge cpu\"
+
+        Host vscode-remote-cpu-4
+            User bgregor
+            IdentityFile ~/.ssh/vscode-remote
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge -pe omp 4 -l h_rt=24:00:00\"
             StrictHostKeyChecking no
 
-        Host vscode-remote-sge-cpu4
-            User USERNAME
-            IdentityFile ~/.ssh/vscode-remote-sge
-            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge cpu_4\"
+        Host vscode-remote-cpu-1
+            User bgregor
+            IdentityFile ~/.ssh/vscode-remote
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge -pe omp 1\"
             StrictHostKeyChecking no
 
+        Host vscode-remote-gpu
+            User bgregor
+            IdentityFile ~/.ssh/vscode-remote
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge -pe omp 8 -l gpus=1 -l gpu_type=H200\"
+            StrictHostKeyChecking no
+
+        # Two independent 1-core sessions:
+        Host vscode-remote-cpu-1a
+            User bgregor
+            IdentityFile ~/.ssh/vscode-remote
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge -pe omp 1 -N jobA\"
+            StrictHostKeyChecking no
+
+        Host vscode-remote-cpu-1b
+            User bgregor
+            IdentityFile ~/.ssh/vscode-remote
+            ProxyCommand ssh HPC-LOGIN \"~/bin/vscode-remote-sge -pe omp 1 -N jobB\"
+            StrictHostKeyChecking no
     "
+}
+
+function parse_qsub_args () {
+    # Extract -N <label> from args (sets QSUB_JOB_LABEL).
+    # All remaining args are stored in QSUB_ARGS_ARRAY for passing to qsub.
+    QSUB_JOB_LABEL=""
+    QSUB_ARGS_ARRAY=()
+
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "-N" ] && [ $# -gt 1 ]; then
+            QSUB_JOB_LABEL="$2"
+            shift 2
+        else
+            QSUB_ARGS_ARRAY+=("$1")
+            shift
+        fi
+    done
+}
+
+function compute_job_prefix () {
+    # Build the stable job-name prefix used to find/submit jobs:
+    #   vscode-remote-[LABEL.]HASH.USER
+    # HASH is the md5 of the qsub args (excluding -N), so the same resource
+    # spec always maps to the same job, enabling automatic reconnection.
+    local hash
+    hash=$(echo "${QSUB_ARGS_ARRAY[*]}" | md5sum | cut -d ' ' -f 1)
+
+    local prefix="vscode-remote-"
+    if [ -n "$QSUB_JOB_LABEL" ]; then
+        prefix="${prefix}${QSUB_JOB_LABEL}."
+    fi
+    prefix="${prefix}${hash}.${USER}"
+    echo "$prefix"
 }
 
 function query_sge () {
@@ -84,7 +118,7 @@ function query_sge () {
         JOB_STATE=$(echo "$job_info" | awk '{print $5}')
         JOB_QUEUE_INSTANCE=$(echo "$job_info" | awk '{print $8}')
 
-        # Extract port from full job name (format: vscode-remote-<profile>-PORT)
+        # Extract port from full job name (format: PREFIX-PORT)
         JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
 
         # Convert queue instance like "p-int@scc-pi4.scc.bu.edu" -> "scc-pi4.scc.bu.edu"
@@ -120,28 +154,6 @@ function timeout () {
     fi
 }
 
-
-
-function list_profiles () {
-    # List available QSUB_PARAM_* presets, printed as profile names (lowercase)
-    compgen -A variable QSUB_PARAM_ | sed 's/^QSUB_PARAM_//' | tr '[:upper:]' '[:lower:]'
-}
-
-function resolve_profile () {
-    PROFILE_RAW="$1"
-    # Map profile to variable key: cpu-4 -> CPU_4, cpu_4 -> CPU_4
-    PROFILE_KEY="$(echo "$PROFILE_RAW" | tr '[:lower:]-' '[:upper:]_')"
-    QSUB_VAR="QSUB_PARAM_${PROFILE_KEY}"
-    QSUB_PARAM="${!QSUB_VAR:-}"
-
-    if [ -z "$QSUB_PARAM" ]; then
-        >&2 echo "Unknown profile '$PROFILE_RAW' (expected variable $QSUB_VAR)."
-        >&2 echo "Available profiles:"
-        list_profiles | sed 's/^/  - /' >&2
-        exit 1
-    fi
-}
-
 function collect_jobs () {
     # Collect (jid, full_name, state, node, port) for jobs with name starting with "$1"
     local prefix="$1"
@@ -164,7 +176,7 @@ function collect_jobs () {
 }
 
 function cancel () {
-    # Cancel all running/pending vscode-remote jobs (any profile)
+    # Cancel all running/pending vscode-remote jobs (any options)
     while true; do
         collect_jobs "${JOB_NAME}-"
         if [ ${#JOB_ROWS[@]} -eq 0 ]; then
@@ -187,7 +199,7 @@ function list () {
 }
 
 function ssh_connect () {
-    # SSH into the node of a running vscode-remote job (any profile)
+    # SSH into the node of a running vscode-remote job (any options)
     collect_jobs "${JOB_NAME}-"
 
     if [ ${#JOB_ROWS[@]} -eq 0 ]; then
@@ -203,8 +215,7 @@ function ssh_connect () {
             state="$(echo "$row" | cut -d'|' -f3)"
             node="$(echo "$row" | cut -d'|' -f4)"
             port="$(echo "$row" | cut -d'|' -f5)"
-            printf "%d) %s (state: %s%s%s)
-" "$i" "$full" "$state" "${node:+, node: }" "${node:-}"
+            printf "%d) %s (state: %s%s%s)\n" "$i" "$full" "$state" "${node:+, node: }" "${node:-}"
             i=$((i+1))
         done
         read -p "Enter a number: " choice
@@ -230,19 +241,19 @@ function ssh_connect () {
     ssh -p "$port" "$node"
 }
 
-function connect_profile () {
-    local profile="$1"
-    resolve_profile "$profile"
-    local job_prefix="${JOB_NAME}-${profile}"
+function connect () {
+    local job_prefix
+    job_prefix=$(compute_job_prefix)
 
     query_sge "$job_prefix"
 
     if [ -z "${JOB_STATE}" ]; then
         PORT=$(shuf -i 10000-65000 -n 1)
-        # Submit job with qsub, capture job ID from output
-        submit_output=$(qsub -N "$job_prefix-$PORT" $QSUB_PARAM "$SCRIPT_DIR/vscode-remote-job-sge.sh" "$PORT" 2>&1)
+        # Submit job; -N sets the full job name (prefix + port for later discovery)
+        submit_output=$(qsub -N "$job_prefix-$PORT" "${QSUB_ARGS_ARRAY[@]}" "$SCRIPT_DIR/vscode-remote-job-sge.sh" "$PORT" 2>&1)
         JOB_SUBMIT_ID=$(echo "$submit_output" | grep -oE '[0-9]+' | head -1)
-        >&2 echo "Submitted new $job_prefix job (id: $JOB_SUBMIT_ID)"
+        >&2 echo "Submitted new job (id: $JOB_SUBMIT_ID, name: $job_prefix-$PORT)"
+        >&2 echo "  qsub args: ${QSUB_ARGS_ARRAY[*]}"
     fi
 
     while [ ! "$JOB_STATE" == "r" ]; do
@@ -271,7 +282,12 @@ if [ ! -z "${1:-}" ]; then
         cancel) cancel ;;
         ssh)    ssh_connect ;;
         help)   usage ;;
-        *)      connect_profile "$1" ;;
+        -*)     parse_qsub_args "$@"; connect ;;
+        *)
+            >&2 echo "Unknown command: $1"
+            usage
+            exit 1
+            ;;
     esac
     exit 0
 else
