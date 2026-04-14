@@ -121,18 +121,9 @@ function query_sge () {
         # Extract port from full job name (format: PREFIX-PORT)
         JOB_PORT=$(echo "$JOB_FULLNAME" | rev | cut -d'-' -f1 | rev)
 
-        # Get full exec_host from qstat -j instead of truncated qstat table output
-        JOB_EXEC_HOST=$(qstat -j "$JOB_ID" 2>/dev/null | awk -F: '/exec_host:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')
-
-        # exec_host examples:
-        #   all.q@scc-tj4.scc.bu.edu
-        #   all.q@scc-tj4.scc.bu.edu/0
-        if [[ "$JOB_EXEC_HOST" == *@* ]]; then
-            JOB_NODE="${JOB_EXEC_HOST##*@}"
-            JOB_NODE="${JOB_NODE%%/*}"
-        else
-            JOB_NODE=""
-        fi
+        # The host is retrieved from qstat -u username. 
+        node="$(echo "$line" | awk '{print $8}' | cut -d@ -f2 | sed 's/\.scc\././' | awk -F. '{print $1}')"
+        JOB_NODE="$(qstat -u $USER | grep $JOB_ID | awk '{print $8}' | cut -d@ -f2 | sed 's/\.scc\././' | awk -F. '{print $1}')"
 
         >&2 echo "Job is $JOB_STATE ( id: $JOB_ID, name: $JOB_FULLNAME${JOB_NODE:+, node: $JOB_NODE} )"
     else
@@ -169,15 +160,10 @@ function collect_jobs () {
       jid="$(echo "$line" | awk '{print $1}')"
       state="$(echo "$line" | awk '{print $5}')"
       full="$(qstat -j "$jid" 2>/dev/null | awk -F: '/job_name:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
+      # On the BU SCC a string like "queuename@scc-xyz.bu.edu" becomes "scc-xyz"
+      node="$(echo "$line" | awk '{print $8}' | cut -d@ -f2 | sed 's/\.scc\././' | awk -F. '{print $1}')"
       if [[ "$full" == "$prefix"* ]]; then
         port="$(echo "$full" | rev | cut -d'-' -f1 | rev)"
-        exechost="$(qstat -j "$jid" 2>/dev/null | awk -F: '/exec_host:/ {gsub(/^[ \t]+/,"",$2); print $2; exit}')"
-        if [[ "$exechost" == *@* ]]; then
-            node="${exechost##*@}"
-            node="${node%%/*}"
-        else
-            node=""
-        fi
         JOB_ROWS+=("$jid|$full|$state|$node|$port")
       fi
     done < <(qstat -u "$USER" 2>/dev/null | awk '$3 ~ /^vscode-rem/ {print}')
